@@ -1,0 +1,671 @@
+---
+title: "Survival and longitudinal data analysis"
+subtitle: "Comparaison de la prédiction par modèle de survie et par algorithmes de classification"
+author: "Guedj O. et Marcoux Pépin T."
+date: "06/11/2019"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 4
+---
+
+
+
+# 1. Packages
+
+```{r}
+suppressMessages(library(KMsurv))
+suppressMessages(library(tidyverse))
+suppressMessages(library(survival))
+suppressMessages(library(dplyr))
+suppressMessages(library(survminer))
+suppressMessages(library(ggplot2))
+suppressMessages(library(ggfortify))
+suppressMessages(library(caTools))
+suppressMessages(library(caret))
+suppressMessages(library(MASS))
+suppressMessages(library(psych))
+suppressMessages(library(kableExtra))
+suppressMessages(library(pROC))
+suppressMessages(library(e1071))
+suppressMessages(library(class))
+suppressMessages(library(randomForest))
+```
+
+# 2. Données
+
+Les données étudiées sont issues du jeu de données wpcb: une étude portée sur les cancer du sein de 198 femmes du Winsconsis, USA.
+Le jeu de données est composé de 198 individus décrits par 35 variables dont:
+* Une variable d'identification `id`,
+* Une variable indiquant s'il y a eu rechute du cancer ou non `recurrent`,
+* Une variable indiquant le temps de rechute `time` (en mois) pour les individus ayant rechuté et indiquant le temps à l'état sain pour les individus n'ayant pas rechuté,
+* Le reste des variables décrivent la tumeur : sa texture, son périmètre, sa surface...
+
+## 2.1. Importation des données et mise en forme
+
+Dans le dataset, les NA sont représentées par des "?".
+
+```{r,warning=FALSE}
+data = read.csv("https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wpbc.data",
+                header=F, 
+                sep=",",
+                na = "?")
+```
+
+De plus les variables sont nommées de `var1` à `var35`, il faut donc leur donner des noms plus appropriés.
+
+```{r}
+var.names = paste0(rep(c('radius','texture','perimeter','area','smoothness','compactness',
+                         'concavity','concave points','symmetry','fractal dimension'),3),
+                   c(rep('_mean',10),rep('_SD',10),rep('_worst',10)))
+names(data) = c('id','recurrent','time', var.names,c('Tumor size','Lymph node status'))
+
+```
+
+On transforme le type de l'identifiant en factor. Dans la variable `recurrent` on remplace les N par `FALSE` et les R par `TRUE`. On transforme également la variable `time` en numeric.
+
+```{r}
+data = data %>% mutate(id = factor(id)) %>% 
+                mutate( recurrent = recode_factor(recurrent , "N" = FALSE, 'R' = TRUE )) 
+
+data$recurrent = as.logical(data$recurrent)
+
+data = dplyr::mutate(data,time=as.numeric(time))
+```
+
+
+## 2.2. Gestion des valeurs manquantes 
+
+```{r}
+na.nbr = NULL
+for( i in colnames(data)){
+  na.nbr[i] = length(which(is.na(data[,i])))
+}
+rm(i)
+tab.na = cbind(names(data), na.nbr)
+kable(tab.na, col.names = c("Variables","Nombre de NA"), row.names = F, 
+      caption = "Vue d'ensemble des données manqanutes des données wpbc") %>%
+  kable_styling(latex_options = "striped", stripe_color = "gray!6")
+```
+(voir Table 1)
+
+On fait le choix de remplacer les NA de `Lymph node status` par la médiane de la variable correspondante.
+
+```{r}
+data.no.NA = data %>% replace_na(list(`Lymph node status` = median(data$`Lymph node status`,na.rm =T)))
+```
+
+## 2.3. Data Exploration
+
+
+### 2.3.1. Rechute
+
+```{r}
+tab.recur = cbind(c("Non","Oui"),table(data.no.NA$recurrent), round(prop.table(table(data.no.NA$recurrent))*100, 2))
+kable(tab.recur, col.names = c("Rechute ","n","%"),
+      row.names = F,
+      caption = "Nombre de rechutes") %>%
+  kable_styling(latex_options = "basic")
+```
+On remarque la faible proportion de rechutes (Table 2). C'est un élément auquel il faut préter attention, d'une part lors du split des données et d'autre part pour expliquer une eventuelle difficulté des algorithmes de machine learning à prédire cette rechute.
+
+### 2.3.2. Variables décrivant la tumeur
+
+```{r}
+desc.var.tum = round(describe(data.no.NA[,4:35])[c(1,2,3,4,5,8,9)],2)
+kable(desc.var.tum, caption = "Aperçu des variables décrivants la tumeur") %>%
+  kable_styling(latex_options = "striped", stripe_color = "gray!6")
+```
+(Table 3)
+
+## 2.4. Scaling
+
+Pour pouvoir comparer les variables entre elles on les normalise en centrant et réduisant les données (sauf les 3 premières variables: `id`, `recurrent` et `time`).
+
+```{r}
+scale = function(x){
+  (x- mean(x,na.rm=T)) / sd(x,na.rm=T)
+}
+
+data.scaled =  data.no.NA %>% mutate_at(names(data)[-c(1,2,3)], scale)
+```
+
+## 2.5. Variable de censure
+
+On note `Z` la variable de censure. Trois cas sont possibles:
+
+* Si le temps d'observation est plus petit ou égal à 24 mois et qu'il y a eu rechute alors il a censure et `Z` = 1
+* Si le temps d'observation est superieur à 24 mois  et qu'il y a eu rechute alors il n'y a pas censure et `Z` = 0
+* Enfin, si le temps d'observation est superieur à 24 mois et qu'il n'y a pas eu rechute alors on ne sait pas et `Z` = NA 
+
+```{r}
+data.scaled = data.scaled %>%
+  mutate(Z = ifelse( (time <= 24) & (recurrent == T),1,
+                  ifelse( (time > 24) & (recurrent == T),0,
+                         ifelse( (time > 24) & (recurrent == F),0,NA)
+                         )
+                  )
+         )
+data.scaled$Z = as.factor(data.scaled$Z)
+
+kable(table(data.scaled$Z, useNA = "always"),
+      caption = "Variable de censure", 
+      col.names = c("z","n"))
+```
+(voir Table 4)
+
+## 2.6. Split des données
+
+On ajoute à data.scaled une variable d'indices: chiffres de 1 à 198 afin d'effectuer un tirage aléatoire d'invidus dans le jeu de données.
+
+Puis on utilise la fonction `createDataPartition` pour attribuer $80 \%$ des données au train et les stocker dans une matrice (list = FALSE).
+
+```{r}
+set.seed(42) #Create simulated values that are reproductible.
+data.scaled = data.scaled %>% mutate(id_1n = c(1:nrow(data.scaled)))
+trainIndex = createDataPartition(data.scaled$recurrent, p = 0.8, list = FALSE, times = 1)
+train = data.scaled %>% filter(id_1n %in% trainIndex)
+test = data.scaled[-which(data.scaled$id_1n %in% train$id_1n),]
+```
+
+On peut vérifier graphiquement la bonne stratification des données:
+```{r}
+par(mfrow = c(1,2))
+barplot(prop.table(table(train$recurrent))*100, col = c("orange","steelblue"),
+        main = "Recurrent dans le train ")
+barplot(prop.table(table(test$recurrent))*100, col = c("orange","steelblue"),
+        main = "Recurrent dans le test")
+```
+
+Enfin, on crée une autre partition des données en train et en test ($80 \% ~/~20\%$) sans la variable de censure:
+
+```{r}
+train.surv = train %>% dplyr::select(-Z)
+test.surv = test %>% dplyr::select(-Z)
+```
+
+# 3. Modèles de Survie
+
+
+## 3.1. Kaplan Meier global
+
+```{r}
+km.global = survfit(Surv(time, recurrent) ~ 1, data = train.surv)
+ggsurvplot(km.global, ylim = c(0.5,1), palette = "blue") + ggtitle("Courbe de Kaplan Meir globale") 
+```
+
+
+## 3.2. Modèle de Cox full 
+
+### 3.2.1 Modèle
+
+On commence par un modèle full (sans les deux variables d'identification):
+```{r}
+cox.all = coxph(Surv(time,recurrent)~.-id -id_1n ,data = train.surv)
+
+df.cox.all = data.frame(format(summary(cox.all)$conf.int[,1],scientific = T, digit = 2),
+                        paste("[",format(summary(cox.all)$conf.int[,3], scientific = T, digit = 2),
+                              ";",format(summary(cox.all)$conf.int[,4],scientific = T, digit = 2),"]"),
+                        format(summary(cox.all)$coefficient[,5], scientific = T, digit = 2), 
+                        ifelse(summary(cox.all)$coefficient[,5] <= 0.05, "*","")
+)
+                        
+colnames(df.cox.all) = c("exp(coef)", "IC", "p", "Significativité ")
+kable(df.cox.all, caption = "Modèle de cox avec toutes les covariables") %>%
+  kable_styling(latex_options = "striped", stripe_color = "gray!6")
+
+```
+On remarque que très peu de variables sont significatives.
+
+
+```{r}
+cat("La probabilité de ne pas rechuter à 24 mois est de", 
+    round(unlist(summary(km.global, time = 24))$surv, 2),"avec un IC de [", 
+    round(unlist(summary(km.global, time = 24))$lower,2),";" ,
+    round(unlist(summary(km.global, time = 24))$upper, 2), "]")
+```
+
+### 3.2.2 Prédiction, ROC et AUC
+
+```{r}
+plot(survfit(cox.all , newdata = test.surv), xlab = "Mois", ylab="Non-Rechute",
+     main = "Prédiction de la survie en fonction du temps dans le test")
+abline(v = 24, col = "blue")
+```
+
+```{r}
+pred.cox.all = survfit(cox.all , newdata = test.surv)
+prob.pred.24.all = pred.cox.all$surv[24,]
+```
+
+`prob.pred.24` contient les predictions de survie à 24 mois des individus du jeu de données test. 
+
+Une probabilité élévée indique une grande chance de survie donc une faible chance d'avoir une rechute de cancer.
+
+En fixant un seuil à 0.5 on peut ainsi dire que, si un individu a une propabilité de survie plus petite que 0.5 alors il a une "grande" chance de rechuter. Donc, on attribue la valeur 1 à la variable de rechute prédite et 0 dans le cas contraire.
+
+```{r}
+pred.24.all = ifelse(prob.pred.24.all <= 0.5, 1, 0)
+pred.24.all = as.factor(pred.24.all)
+```
+
+On obtient alors la matrice de confusion suivante (Table 6):
+
+```{r}
+kable(table(Predicted = pred.24.all,Real = test.surv$recurrent), caption = "Matrice de confusion pour la prédiction dans le modele cox.all", col.names = c("Real.0","Real.1"))
+```
+
+
+Le modèle a du mal à prédire correctement les cas de rechute. Cela est peut-être du au faible nombre de rechutes dans le jeu de données par rapport à celui de non-rechutes.
+
+
+En faisant varier le seuil précédent entre 0 et 1 on obtient la courbe ROC suivante:
+
+```{r}
+roc.cox.all = roc(response = test.surv$recurrent, predictor = prob.pred.24.all)
+plot(roc.cox.all, main = "Courbe ROC pour le modèle cox.all")
+```
+
+```{r}
+auc.cox.all = auc(roc.cox.all)
+cat("L'AUC du modèle cox.all est de:",auc.cox.all)
+```
+
+A seuil fixé on peut calculer une précision du modèle, afin de comparer ces résultats aux modèles dont ont ne peut pas tracer la courbe ROC.
+
+Etant donné qu'il est très important de bien classifier les individus qui vont effectivement faire une rechute à 24 mois, on choisi un seuil "bas".
+
+```{r}
+pred.24.all.bis = ifelse(prob.pred.24.all <= 0.5, 1, 0)
+pred.24.all.bis = as.factor(pred.24.all.bis)
+table(Pred = pred.24.all.bis, real = test.surv$recurrent)
+```
+On a donc une précision de $ (26+1)/39 = 0.6923077$:
+```{r, echo=FALSE}
+acc.cox.all = (26 +1) /39
+```
+
+### 3.2.3 Diagnostique du modèle 
+
+Le modèle de Cox a une hypothèse importante: la proportionnalité des risques relatifs (équivalente à la non dépendance en temps des résidus de Schonfeld).
+
+Pour la vérifier on peut:
+
+* Faire un test
+* Regarer l'allure des résidus
+
+```{r}
+test.hyp.cox.all <- cox.zph(cox.all)
+kable(format(as.matrix(test.hyp.cox.all$table), scientific = T, digit = 2)) %>%
+  kable_styling(latex_options = "striped", stripe_color = "gray!6")
+```
+
+Aucune des p.valeur n'est inferieure à 0.05. Etanr donné que l'hypothèse nulle de ce test est la non-dependance en temps des résidus de schonfeld et compte tenu des p.valeur obtenues on peut conclure à la vérification de l'hypothèse de proportionnalité des risques relatifs (c'est à dire on ne rejette pas $H_0$).
+
+On peut afficher les 4 premiers graphes de résidus:
+```{r, width = '75%'}
+ggcoxzph(test.hyp.cox.all)[1]
+ggcoxzph(test.hyp.cox.all)[2]
+ggcoxzph(test.hyp.cox.all)[3]
+ggcoxzph(test.hyp.cox.all)[4]
+```
+
+
+## 3.3 Step AIC
+
+### 3.3.1 Cox model
+
+On effectue alors une sélection de variables basée sur le critère AIC:
+```{r}
+cox.AIC = stepAIC(cox.all,trace=F)
+df.cox.AIC = data.frame(format(summary(cox.AIC)$conf.int[,1],scientific = T, digit = 2),
+                        paste("[",format(summary(cox.AIC)$conf.int[,3], scientific = T, digit = 2),
+                              ";",format(summary(cox.AIC)$conf.int[,4],scientific = T, digit = 2),"]"),
+                        format(summary(cox.AIC)$coefficient[,5], scientific = T, digit = 2), 
+                        ifelse(summary(cox.AIC)$coefficient[,5] <= 0.05, "*","")
+)
+                        
+colnames(df.cox.AIC) = c("exp(coef)", "IC", "p", "Significativité ")
+kable(df.cox.AIC, caption = "Modèle de cox avec toutes les covariables") %>%
+  kable_styling(latex_options = "striped", stripe_color = "gray!6")
+
+```
+
+Le modèle final a retenu 12 variables.
+
+
+### 3.3.2 Prediction, ROC et AUC
+
+```{r}
+plot(survfit(cox.AIC , newdata = test.surv), xlab = "Mois", ylab="Non-Rechute", main = "Prédiction de la survie en fonction du temps dans le test")
+abline(v = 24, col = "blue")
+```
+
+```{r}
+pred.cox.AIC = survfit(cox.AIC , newdata = test.surv)
+prob.pred.24.AIC = pred.cox.AIC$surv[24,]
+```
+
+```{r}
+pred.24.AIC = ifelse(prob.pred.24.AIC <= 0.5, 1, 0)
+pred.24.AIC = as.factor(pred.24.AIC)
+```
+
+On obtient alors la matrice de confusion suivante (Table 8):
+
+```{r}
+kable(table(Predicted = pred.24.AIC, Real = test.surv$recurrent),
+      caption = "Matrice de confusion pour la prédiction dans le modele cox.AIC",
+      col.names = c("Real.0","Real.1"))
+```
+
+
+Le modèle a du mal à prédire correctement les cas de rechute. Cela est peut-être du au faible nombre de rechutes dans le jeu de données par rapport à celui de non-rechutes.
+
+En faisant varier le seuil entre 0 et 1 on obtient la courbe ROC suivante:
+
+```{r}
+roc.cox.AIC = roc(response = test.surv$recurrent, predictor = prob.pred.24.AIC)
+plot(roc.cox.AIC, main = "Courbe ROC pour le modèle cox.AIC")
+```
+
+```{r}
+auc.cox.AIC = auc(roc.cox.AIC)
+cat("L'AUC du modèle cox.AIC est de:",auc.cox.AIC)
+```
+De même que précédement, on fixe un seuil à 0.5 et on calcule la précision du cox.AIC:
+
+```{r}
+pred.24.AIC.bis = ifelse(prob.pred.24.AIC <= 0.5, 1, 0)
+pred.24.AIC.bis = as.factor(pred.24.AIC.bis)
+table(Pred = pred.24.AIC.bis, real = test.surv$recurrent)
+```
+On a donc une précision de $ (29+1)/39 = 0.7692308$.
+```{r, echo=FALSE}
+acc.cox.AIC = (29 + 1) /39
+```
+### 3.3.3 Diagnostique du modèle
+
+```{r}
+test.hyp.cox.AIC <- cox.zph(cox.AIC)
+kable(format(as.matrix(test.hyp.cox.AIC$table), scientific = T, digit = 2)) %>%
+  kable_styling(latex_options = "striped", stripe_color = "gray!6")
+```
+
+Aucune des p.valeur n'est inférieure à 0.05. Etant donné que l'hypothèse nulle de ce test est la non-dépendance en temps des résidus de Schonfeld et, compte tenu des p.valeur obtenues, on peut conclure à la vérification de l'hypothèse de proportionnalité des risques relatifs (c'est à dire on ne rejette pas $H_0$).
+
+```{r, width = '75%'}
+ggcoxzph(test.hyp.cox.AIC)[1]
+ggcoxzph(test.hyp.cox.AIC)[2]
+ggcoxzph(test.hyp.cox.AIC)[3]
+ggcoxzph(test.hyp.cox.AIC)[4]
+```
+
+# 4. Classification 
+
+Afin de comparer les résultats des modèles de classification avec ceux du modèle `cox.AIC` et `cox.all`, pour chaque classifieur nous feraont deux prédition: l'une en se basant sur les variables du modèle complet et l'autre sur les varaible du modèle AIC.
+
+## 4.1 Création du train et du test 
+
+### 4.1.1 Avec toutes les variables
+
+```{r}
+var.all = c( "recurrent","radius_mean","texture_mean","perimeter_mean","area_mean",
+             "smoothness_mean","compactness_mean" ,"concavity_mean",
+             "concave points_mean","symmetry_mean", "fractal dimension_mean",
+             "radius_SD","texture_SD","perimeter_SD","area_SD"            ,"smoothness_SD"          ,   "compactness_SD"           
+ ,"concavity_SD"           ,   "concave points_SD"      
+ ,"symmetry_SD"            ,   "fractal dimension_SD"   
+ ,"radius_worst"           ,   "texture_worst"            
+ ,"perimeter_worst"        ,   "area_worst"               
+ ,"smoothness_worst"       ,   "compactness_worst"        
+ ,"concavity_worst"        ,   "concave points_worst"   
+ ,"symmetry_worst"         ,   "fractal dimension_worst"
+ ,"Tumor size"           ,   "Lymph node status"    )
+
+train.clf.all = train[, var.all]
+test.clf.all = test[, var.all]
+```
+
+### 4.1.2 Avec les variables issues de l'AIC
+```{r}
+var.AIC = c("recurrent", "radius_mean", "perimeter_mean", "smoothness_mean", "concavity_mean", "fractal dimension_mean",
+    "texture_SD", "perimeter_SD", "compactness_SD", "concavity_SD", "compactness_worst", "concavity_worst", "Lymph node status")
+train.clf.AIC = train[, var.AIC]
+test.clf.AIC = test[, var.AIC]
+```
+
+## 4.2 Prédictions, ROC, AUC et Accuracy sur les variables issues de l'AIC
+
+### 4.2.1 Naives Bayes
+
+```{r}
+
+mod.NB.AIC = naiveBayes(recurrent ~ ., data = train.clf.AIC)
+pred.NB.AIC = predict(mod.NB.AIC, subset(test.clf.AIC, select = -recurrent))
+cm.NB.AIC = confusionMatrix(as.factor(pred.NB.AIC), as.factor(test.clf.AIC$recurrent))
+cm.NB.AIC$table
+acc.NB.AIC = cm.NB.AIC$overall[1]
+acc.NB.AIC
+```
+
+Malgré une précision correcte sur le jeu de données test, la matrice de confusion nous informe que la majorité des erreurs de classification commises par l'algorithme sont dues à une mauvaise prédiction des cas de rechute (`reccurent`=TRUE). Seulement ce sont bien ces cas que l'on cherche à prédire de la meilleure manière possible.
+
+### 4.2.2 Linear Discriminant Analysis
+
+```{r}
+mod.lda.AIC = lda(recurrent ~ ., data = train.clf.AIC)
+pred.lda.AIC = predict(mod.lda.AIC, subset(test.clf.AIC, select = -recurrent))
+cm.lda.AIC = confusionMatrix(as.factor(pred.lda.AIC$class), as.factor(test.clf.AIC$recurrent))
+cm.lda.AIC$table
+acc.lda.AIC = cm.lda.AIC$overall[1]
+acc.lda.AIC
+```
+
+Résultats similaires à la méthode précédente, même erreur de prédiction.
+
+### 4.2.3 Quadratic Discriminant Analysis
+
+```{r}
+mod.qda.AIC = qda(recurrent ~ ., data=train.clf.AIC)
+pred.qda.AIC = predict(mod.qda.AIC, subset(test.clf.AIC, select = -recurrent))
+cm.qda.AIC = confusionMatrix(as.factor(pred.qda.AIC$class), as.factor(test.clf.AIC$recurrent))
+cm.qda.AIC$table
+acc.qda.AIC = cm.qda.AIC$overall[1]
+acc.qda.AIC
+```
+
+Résultats semblables, même moins précis.
+
+### 4.2.4. Support Vector Machine
+
+```{r}
+mod.svm.AIC <- svm(recurrent ~ ., data=train.clf.AIC, type="C")
+pred.svm.AIC = predict(mod.svm.AIC, subset(test.clf.AIC, select = -recurrent))
+cm.svm.AIC = confusionMatrix(as.factor(pred.svm.AIC), as.factor(test.clf.AIC$recurrent))
+cm.svm.AIC$table
+acc.svm.AIC = cm.svm.AIC$overall[1]
+acc.svm.AIC
+```
+
+Résultats encore moins bons.
+
+### 4.2.5. kNN
+
+```{r}
+mod.knn.AIC = as.factor(knn(train=train.clf.AIC[-c(1)], test=test.clf.AIC[-c(1)], cl=train.clf.AIC$recurrent, k=5))
+cm.knn.AIC = confusionMatrix(as.factor(mod.knn.AIC), as.factor(test.clf.AIC$recurrent))
+cm.knn.AIC$table
+acc.knn.AIC = cm.knn.AIC$overall[1]
+acc.knn.AIC
+```
+
+Résultats similaires.
+### 4.2.6 Random Forest
+
+```{r}
+train.recurrent.AIC = as.factor(train.clf.AIC$recurrent)
+test.recurrent.AIC = as.factor(test.clf.AIC$recurrent)
+mod.rf.AIC = randomForest(train.clf.AIC[,-c(1)], train.recurrent.AIC)
+pred.rf.AIC = predict(mod.rf.AIC, newdata=test.clf.AIC[,-c(1)], type="class")
+cm.rf.AIC = confusionMatrix(pred.rf.AIC, as.factor(test.recurrent.AIC))
+cm.rf.AIC$table
+acc.rf.AIC = cm.rf.AIC$overall[1]
+acc.rf.AIC
+```
+
+```{r}
+roc.rf.AIC = roc(train.clf.AIC$recurrent, mod.rf.AIC$votes[,2] )
+plot(roc.rf.AIC)
+auc.rf.AIC = paste("AUC :", round(auc(roc.rf.AIC),3)) 
+text(0.0, 0.2, auc.rf.AIC)
+```
+
+## 4.3. Prédictions, ROC, AUC et Accuracy sur les variables issues du modèle complet
+
+### 4.3.1 Naives Bayes
+
+```{r}
+mod.NB.all = naiveBayes(recurrent ~ ., data = train.clf.all)
+pred.NB.all = predict(mod.NB.all, subset(test.clf.all, select = -recurrent))
+cm.NB.all = confusionMatrix(as.factor(pred.NB.all), as.factor(test.clf.all$recurrent))
+cm.NB.all$table
+acc.NB.all = cm.NB.all$overall[1]
+acc.NB.all
+```
+
+Malgré une précision correcte sur le jeu de données test, la matrice de confusion nous informe que la majorité des erreurs de classification commises par l'algorithme sont dues à une mauvaise prédiction des cas de rechute (`reccurent`=TRUE). Seulement ce sont bien ces cas que l'on cherche à prédire de la meilleure manière possible.
+
+### 4.3.2 Linear Discriminant Analysis
+
+```{r}
+mod.lda.all = lda(recurrent ~ ., data = train.clf.all)
+pred.lda.all = predict(mod.lda.all, subset(test.clf.all, select = -recurrent))
+cm.lda.all = confusionMatrix(as.factor(pred.lda.all$class), as.factor(test.clf.all$recurrent))
+cm.lda.all$table
+acc.lda.all = cm.lda.all$overall[1]
+acc.lda.all
+```
+
+Résultats similaires à la méthode précédente, même erreur de prédiction.
+
+### 4.3.3 Quadratic Discriminant Analysis
+
+```{r}
+mod.qda.all = qda(recurrent ~ ., data=train.clf.all)
+pred.qda.all = predict(mod.qda.all, subset(test.clf.all, select = -recurrent))
+cm.qda.all = confusionMatrix(as.factor(pred.qda.all$class), as.factor(test.clf.all$recurrent))
+cm.qda.all$table
+acc.qda.all = cm.qda.all$overall[1]
+acc.qda.all
+```
+
+Résultats semblables, même moins précis.
+
+### 4.3.4. Support Vector Machine
+
+```{r}
+mod.svm.all <- svm(recurrent ~ ., data=train.clf.all, type="C")
+pred.svm.all = predict(mod.svm.all, subset(test.clf.all, select = -recurrent))
+cm.svm.all = confusionMatrix(as.factor(pred.svm.all), as.factor(test.clf.all$recurrent))
+cm.svm.all$table
+acc.svm.all = cm.svm.all$overall[1]
+acc.svm.all
+```
+
+Résultats encore moins bons.
+
+### 4.3.5. kNN
+
+```{r}
+mod.knn.all = as.factor(knn(train=train.clf.all[-c(1)], test=test.clf.all[-c(1)], cl=train.clf.all$recurrent, k=5))
+cm.knn.all = confusionMatrix(as.factor(mod.knn.all), as.factor(test.clf.all$recurrent))
+cm.knn.all$table
+acc.knn.all = cm.knn.all$overall[1]
+acc.knn.all
+```
+
+Résultats similaires.
+
+### 4.3.6. Random Forest
+
+```{r}
+train.recurrent.all = as.factor(train.clf.all$recurrent)
+test.recurrent.all = as.factor(test.clf.all$recurrent)
+mod.rf.all = randomForest(train.clf.all[,-c(1)], train.recurrent.all)
+pred.rf.all = predict(mod.rf.all, newdata=test.clf.all[,-c(1)], type="class")
+cm.rf.all = confusionMatrix(pred.rf.all, as.factor(test.recurrent.all))
+cm.rf.all$table
+acc.rf.all = cm.rf.all$overall[1]
+acc.rf.all
+```
+
+```{r}
+roc.rf.all = roc(train.clf.all$recurrent, mod.rf.all$votes[,2] )
+plot(roc.rf.all)
+auc.rf.all = paste("AUC :", round(auc(roc.rf.all),3)) 
+text(0.0, 0.2, auc.rf.all)
+```
+
+# 5. Résumé des performances des modèles
+
+```{r}
+clf = c("knn","lda","NB","qda","rf","svm","cox")
+acc.AIC = c(acc.knn.AIC, acc.lda.AIC, acc.NB.AIC, acc.qda.AIC,
+            acc.rf.AIC, acc.svm.AIC, acc.cox.AIC)
+df.acc.AIC = data.frame(Classifieurs = clf, Accuracy = acc.AIC)
+ggplot(df.acc.AIC, aes(x = Classifieurs,y = Accuracy)) + geom_point() + ggtitle("Accuracy des modèles bass sur les variables issues de l'AIC")
+#auc.AIC = c(auc.cox.AIC, auc.rf.AIC)
+```
+```{r}
+acc.all = c(acc.knn.all, acc.lda.all, acc.NB.all, acc.qda.all,
+            acc.rf.all, acc.svm.all,acc.cox.all)
+df.acc.all = data.frame(Classifieurs = clf, Accuracy = acc.all)
+ggplot(df.acc.all, aes(x = Classifieurs,y = Accuracy)) + geom_point() + ggtitle("Accuracy des modèles bass sur toutes les variables.")
+#auc.all = c(auc.cox.all, auc.rf.all)
+```
+
+# 6. Conclusion
+
+Un problème récurrent, auxquels tous les algorithmes utilisés sont sensibles, s'observe dans ce contexte de classification: les cas de rechutes sont très mal prédits, car sous-représentés dans le jeu de données. Une manière de pallier cela serait d'équilibrer la répartition des classes dans les différents jeux de données. Seulement, nous ne disposons pas d'un nombre d'observationssuffisant pour lesquelles une rechute est observée à 24 mois.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
